@@ -1,0 +1,54 @@
+name: Build IPA
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build unsigned iOS 16 IPA
+    # Public repo + Intel label: avoids the private-repo billing block and the
+    # arm64 runner queue. Same runner recipe as the verified MyTVBox pipeline.
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-version --sdk iphoneos
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build IPA
+        run: |
+          chmod +x build_ipa.sh
+          ./build_ipa.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yingxia16-IPA
+          path: build/ipa/Yingxia16.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-build.${{ github.run_number }}
+          name: Yingxia16 iOS16 build ${{ github.run_number }}
+          body: |
+            Unsigned IPA, deployment target iOS 16.0 (runs on iOS 16.3).
+            Derived from jo32/tvbox-silicon, slimmed to iOS 16 APIs.
+            Install with TrollStore / AppSync, or re-sign with a free Apple ID.
+          files: build/ipa/Yingxia16.ipa
+          prerelease: true
