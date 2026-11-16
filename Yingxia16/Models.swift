@@ -65,11 +65,36 @@ struct LiveSource: Identifiable, Equatable {
     var id: String { url }
     let name: String
     let url: String
+    let ua: String
 
-    var asDict: [String: String] { return ["name": name, "url": url] }
+    var asDict: [String: String] { return ["name": name, "url": url, "ua": ua] }
 
     static func from(_ d: [String: Any]) -> LiveSource {
-        return LiveSource(name: jsonString(d["name"]), url: jsonString(d["url"]))
+        return LiveSource(name: jsonString(d["name"]),
+                          url: jsonString(d["url"]),
+                          ua: jsonString(d["ua"]))
+    }
+}
+
+struct ConfigResult {
+    let sites: [Site]
+    let lives: [LiveSource]
+    let totalSites: Int
+    let pluginSites: Int
+    let nestedURLs: [String]
+}
+
+enum ConfigError: LocalizedError {
+    case htmlPage
+    case notJSON
+
+    var errorDescription: String? {
+        switch self {
+        case .htmlPage:
+            return "返回的是网页（HTML），请填写配置接口地址，不是网站主页"
+        case .notJSON:
+            return "内容不是 JSON 订阅（也不像 base64 编码的配置）"
+        }
     }
 }
 

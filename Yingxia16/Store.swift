@@ -9,6 +9,8 @@ final class Store: ObservableObject {
     @Published var history: [Video] = []
     @Published var isRefreshing = false
     @Published var statusMessage = "尚未添加订阅"
+    @Published var diagnostics: [String] = []
+    @Published var customSites: [Site] = []
 
     private let defaults = UserDefaults.standard
 
@@ -19,7 +21,10 @@ final class Store: ObservableObject {
         history = loadVideos("history")
         sites = loadDictArray("cachedSites").map { Site.from($0) }
         lives = loadDictArray("cachedLives").map { LiveSource.from($0) }
-        if !sites.isEmpty { statusMessage = "已缓存 \(sites.count) 个源" }
+        customSites = loadDictArray("customSites").map { Site.from($0) }
+        if !sites.isEmpty || !lives.isEmpty {
+            statusMessage = "已缓存 \(sites.count) 个点播源 · \(lives.count) 个直播源"
+        }
     }
 
     private static func hostName(_ raw: String) -> String {
@@ -78,36 +83,97 @@ final class Store: ObservableObject {
         await MainActor.run {
             self.isRefreshing = true
             self.statusMessage = "正在读取订阅…"
+            self.diagnostics = []
         }
         let list = subscriptions
-        var allSites: [Site] = []
+        let manual = customSites
+        var allSites: [Site] = manual
         var allLives: [LiveSource] = []
-        var failures = 0
-        for sub in list {
+        var lines: [String] = []
+        var visited: Set<String> = []
+        var queue: [(String, String, Int)] = list.map { ($0.url, $0.name, 0) }
+        var cursor = 0
+
+        // Breadth-first: expand aggregate subscriptions ("urls") one level deep.
+        while cursor < queue.count {
+            let (url, label, depth) = queue[cursor]
+            cursor += 1
+            if visited.contains(url) { continue }
+            visited.insert(url)
             do {
-                let (s, l) = try await API.fetchConfig(sub.url, subscriptionName: sub.name)
-                allSites.append(contentsOf: s)
-                allLives.append(contentsOf: l)
+                let r = try await API.fetchConfig(url, subscriptionName: label)
+                allSites.append(contentsOf: r.sites)
+                allLives.append(contentsOf: r.lives)
+                var line = "\(label)：共 \(r.totalSites) 个源"
+                if r.pluginSites > 0 {
+                    line += "，\(r.pluginSites) 个 type 3 插件源（本版本不支持）"
+                }
+                if !r.sites.isEmpty { line += "，可用 \(r.sites.count) 个" }
+                if !r.lives.isEmpty { line += "，直播 \(r.lives.count) 个" }
+                if r.sites.isEmpty && r.pluginSites > 0 {
+                    line += " → 点播为空"
+                }
+                lines.append(line)
+                if depth < 1 {
+                    for nested in r.nestedURLs.prefix(5) {
+                        queue.append((nested, "↳ " + label, depth + 1))
+                    }
+                }
             } catch {
-                failures += 1
+                lines.append("\(label)：读取失败 — \(error.localizedDescription)")
             }
+        }
+        if !manual.isEmpty {
+            lines.append("手动添加：\(manual.count) 个 JSON 源")
         }
         let finalSites = allSites
         let finalLives = allLives
+        let finalLines = lines
         await MainActor.run {
             self.sites = finalSites
             self.lives = finalLives
+            self.diagnostics = finalLines
             self.isRefreshing = false
-            if finalSites.isEmpty {
-                self.statusMessage = failures > 0
-                    ? "订阅读取失败：请检查地址或网络"
-                    : "未发现 JSON 源（type 3 插件源不受支持）"
+            if finalSites.isEmpty && finalLives.isEmpty {
+                self.statusMessage = "没有可用源，展开「读取诊断」查看原因"
             } else {
-                self.statusMessage = "\(finalSites.count) 个源 · \(finalLives.count) 个直播源"
+                self.statusMessage = "\(finalSites.count) 个点播源 · \(finalLives.count) 个直播源"
             }
             self.saveDictArray("cachedSites", finalSites.map { $0.asDict })
             self.saveDictArray("cachedLives", finalLives.map { $0.asDict })
         }
+    }
+
+    // MARK: Manually added type 1 (CMS JSON) sources
+
+    func addCustomSite(name: String, api raw: String) -> Bool {
+        let api = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard api.contains("://"), let u = URL(string: api), u.scheme != nil else { return false }
+        guard !customSites.contains(where: { $0.api == api }) else { return false }
+        let title = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let site = Site(key: "custom-" + api,
+                        name: title.isEmpty ? (u.host ?? "自定义源") : title,
+                        type: 1,
+                        api: api,
+                        searchable: 1,
+                        subscriptionName: "手动添加")
+        var arr = customSites
+        arr.append(site)
+        customSites = arr
+        sites.append(site)
+        saveDictArray("customSites", arr.map { $0.asDict })
+        saveDictArray("cachedSites", sites.map { $0.asDict })
+        return true
+    }
+
+    func removeCustomSites(at offsets: IndexSet) {
+        var arr = customSites
+        for index in Array(offsets).sorted(by: >) {
+            if index < arr.count { arr.remove(at: index) }
+        }
+        customSites = arr
+        saveDictArray("customSites", arr.map { $0.asDict })
+        Task { await self.refresh() }
     }
 
     // MARK: Favorites / history

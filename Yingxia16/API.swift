@@ -71,13 +71,16 @@ enum M3U {
 }
 
 enum API {
-    static func request(_ urlString: String) async throws -> Data {
+    static func request(_ urlString: String, ua: String? = nil) async throws -> Data {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed) else { throw APIError.badURL }
         var req = URLRequest(url: url)
         req.timeoutInterval = 20
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15",
-                     forHTTPHeaderField: "User-Agent")
+        let custom = ua ?? ""
+        let agent = custom.isEmpty
+            ? "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15"
+            : custom
+        req.setValue(agent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: req)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw APIError.badResponse
@@ -85,8 +88,8 @@ enum API {
         return data
     }
 
-    static func requestText(_ url: String) async throws -> String {
-        let data = try await request(url)
+    static func requestText(_ url: String, ua: String? = nil) async throws -> String {
+        let data = try await request(url, ua: ua)
         if let s = String(data: data, encoding: .utf8) { return s }
         return String(decoding: data, as: UTF8.self)
     }
@@ -102,16 +105,53 @@ enum API {
 
     // MARK: Subscription config
 
-    static func fetchConfig(_ url: String, subscriptionName: String) async throws -> ([Site], [LiveSource]) {
+    static func fetchConfig(_ url: String, subscriptionName: String) async throws -> ConfigResult {
         let data = try await request(url)
-        let obj = try JSONSerialization.jsonObject(with: data)
-        let root = jsonObject(obj)
+        return try parseConfig(data: data, baseURL: url, subscriptionName: subscriptionName)
+    }
+
+    static func parseConfig(data: Data, baseURL: String, subscriptionName: String) throws -> ConfigResult {
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let head = String(text.prefix(300)).lowercased()
+        if head.contains("<!doctype") || head.contains("<html") || head.contains("<head") {
+            throw ConfigError.htmlPage
+        }
+
+        var obj: Any?
+        if let utf8 = text.data(using: .utf8) {
+            obj = try? JSONSerialization.jsonObject(with: utf8)
+        }
+        if obj == nil {
+            // Some TVBox configs are distributed as a whole base64 blob.
+            let compact = text.components(separatedBy: .whitespacesAndNewlines).joined()
+            if compact.count > 40, let decoded = Data(base64Encoded: compact, options: .ignoreUnknownCharacters) {
+                obj = try? JSONSerialization.jsonObject(with: decoded)
+            }
+        }
+        guard let raw = obj else { throw ConfigError.notJSON }
+
+        var root = jsonObject(raw)
+        if root["sites"] == nil {
+            for key in ["data", "config", "result"] {
+                let nested = jsonObject(root[key])
+                if nested["sites"] != nil { root = nested; break }
+            }
+        }
+
+        let rawSites = jsonArray(root["sites"])
         var sites: [Site] = []
-        for item in jsonArray(root["sites"]) {
+        var pluginCount = 0
+        for item in rawSites {
             let type = jsonInt(item["type"])
-            let api = jsonString(item["api"])
-            // type 3 = JAR/JS/Python plugin source, not supported on iOS 16 slim build.
-            guard !api.isEmpty, type != 3 else { continue }
+            // type 3 = JAR/JS/Python plugin source. Needs the embedded JVM/QuickJS
+            // runtime that this iOS 16 slim build deliberately does not ship.
+            if type == 3 { pluginCount += 1; continue }
+            var api = jsonString(item["api"])
+            if api.isEmpty { api = jsonString(item["ext"]) }
+            if !api.isEmpty && !api.contains("://") {
+                api = absoluteURL(api, relativeTo: baseURL)
+            }
+            guard api.contains("://") else { continue }
             let key = jsonString(item["key"])
             let name = jsonString(item["name"])
             sites.append(Site(key: key.isEmpty ? api : key,
@@ -121,16 +161,52 @@ enum API {
                               searchable: jsonInt(item["searchable"]),
                               subscriptionName: subscriptionName))
         }
+
         var lives: [LiveSource] = []
         for item in jsonArray(root["lives"]) {
             var liveURL = jsonString(item["url"])
             if liveURL.isEmpty { liveURL = jsonString(item["ext"]) }
-            let liveName = jsonString(item["name"])
+            if !liveURL.isEmpty && !liveURL.contains("://") {
+                liveURL = absoluteURL(liveURL, relativeTo: baseURL)
+            }
             if liveURL.contains("://") {
-                lives.append(LiveSource(name: liveName.isEmpty ? "直播" : liveName, url: liveURL))
+                let liveName = jsonString(item["name"])
+                lives.append(LiveSource(name: liveName.isEmpty ? "直播" : liveName,
+                                        url: liveURL,
+                                        ua: jsonString(item["ua"])))
             }
         }
-        return (sites, lives)
+
+        var nested: [String] = []
+        if let urls = root["urls"] as? [Any] {
+            for entry in urls {
+                if let d = entry as? [String: Any] {
+                    let s = jsonString(d["url"])
+                    if s.contains("://") && s != baseURL { nested.append(s) }
+                } else {
+                    let s = jsonString(entry)
+                    if s.contains("://") && s != baseURL { nested.append(s) }
+                }
+            }
+        }
+
+        return ConfigResult(sites: sites, lives: lives,
+                            totalSites: rawSites.count,
+                            pluginSites: pluginCount,
+                            nestedURLs: nested)
+    }
+
+    private static func absoluteURL(_ path: String, relativeTo base: String) -> String {
+        guard let b = URL(string: base) else { return path }
+        if path.hasPrefix("//") { return (b.scheme ?? "https") + ":" + path }
+        if path.hasPrefix("/") {
+            var comps = URLComponents(url: b, resolvingAgainstBaseURL: false)
+            comps?.path = path
+            comps?.query = nil
+            comps?.fragment = nil
+            return comps?.string ?? path
+        }
+        return URL(string: path, relativeTo: b)?.absoluteString ?? path
     }
 
     // MARK: VOD list / categories / search
@@ -252,7 +328,7 @@ enum API {
     }
 
     static func fetchChannels(_ source: LiveSource) async throws -> [Channel] {
-        let text = try await requestText(source.url)
+        let text = try await requestText(source.url, ua: source.ua)
         return M3U.parse(text)
     }
 }

@@ -218,10 +218,12 @@ struct HomeView: View {
             if store.sites.isEmpty {
                 VStack(spacing: 16) {
                     Image(systemName: "film.stack").font(.system(size: 54)).foregroundColor(.secondary)
-                    Text("还没有订阅").font(.title3)
+                    Text("没有可用的点播源").font(.title3)
                     Text(store.statusMessage)
                         .font(.footnote).foregroundColor(.secondary).multilineTextAlignment(.center)
-                    Button("添加订阅") { showSettings = true }.buttonStyle(.borderedProminent)
+                    Text("订阅若全是 type 3 插件源，可到「直播」页看直播，或在「设置」里手动添加 JSON 源 / 查看读取诊断。")
+                        .font(.footnote).foregroundColor(.secondary).multilineTextAlignment(.center)
+                    Button("打开设置") { showSettings = true }.buttonStyle(.borderedProminent)
                 }
                 .padding()
             } else {
@@ -288,6 +290,12 @@ struct HomeView: View {
         .onAppear {
             if selectedSiteID.isEmpty { selectedSiteID = store.sites.first?.id ?? "" }
             vm.load(site: currentSite)
+        }
+        .onChange(of: store.sites.count) { _ in
+            if !store.sites.contains(where: { $0.id == selectedSiteID }) {
+                selectedSiteID = store.sites.first?.id ?? ""
+                vm.reload(site: currentSite)
+            }
         }
         .refreshable {
             await store.refresh()
@@ -476,6 +484,10 @@ struct LiveView: View {
         .onChange(of: selectedID) { _ in
             Task { await vm.load(source) }
         }
+        .onChange(of: store.lives.count) { _ in
+            if selectedID.isEmpty { selectedID = store.lives.first?.id ?? "" }
+            Task { await vm.load(source) }
+        }
         .task { await vm.load(source) }
         .fullScreenCover(item: $playing) { channel in
             PlayerView(url: channel.url, title: channel.name)
@@ -526,6 +538,8 @@ struct LibraryView: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: Store
     @State private var newURL = ""
+    @State private var siteName = ""
+    @State private var siteAPI = ""
     @State private var alertText = ""
     @State private var showAlert = false
 
@@ -559,6 +573,30 @@ struct SettingsView: View {
                 }
             }
 
+            Section("手动添加点播源（type 1 CMS）") {
+                TextField("名称（可留空）", text: $siteName)
+                TextField("API …/api.php/provide/vod/", text: $siteAPI)
+                    .keyboardType(.URL)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                Button("添加源") {
+                    if store.addCustomSite(name: siteName, api: siteAPI) {
+                        siteName = ""
+                        siteAPI = ""
+                    } else {
+                        alertText = "需要完整的 http(s) API 地址，或该地址已添加过"
+                        showAlert = true
+                    }
+                }
+                ForEach(store.customSites) { site in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(site.name).font(.subheadline)
+                        Text(site.api).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                    }
+                }
+                .onDelete { offsets in store.removeCustomSites(at: offsets) }
+            }
+
             Section {
                 Button {
                     Task { await store.refresh() }
@@ -572,10 +610,22 @@ struct SettingsView: View {
                 Text(store.statusMessage).font(.footnote).foregroundColor(.secondary)
             }
 
+            Section("读取诊断") {
+                if store.diagnostics.isEmpty {
+                    Text("点「重新读取订阅」后，这里会逐个显示地址的结果与源类型分布")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+                ForEach(store.diagnostics, id: \.self) { line in
+                    Text(line).font(.footnote).foregroundColor(.secondary)
+                }
+            }
+
             Section("兼容说明") {
                 Text("iOS 16 精简分支，deployment target 16.0，可在 iOS 16.3 运行。")
                     .font(.footnote).foregroundColor(.secondary)
-                Text("仅支持 TVBox type 0/1/4 JSON 源与 M3U/TXT 直播；type 3 插件源（JAR/JS/Python）、ASS 字幕、FFmpeg 转封装、投屏与离线下载已移除。")
+                Text("type 3 插件源（JAR/JS/Python，如 csp_*）需要嵌入式 JVM / QuickJS 运行时，本版本不支持。订阅里若全是这类源，点播会为空，但直播源仍可使用。")
+                    .font(.footnote).foregroundColor(.secondary)
+                Text("订阅地址必须返回 JSON 配置；填写网站主页（HTML）会解析失败。支持 JSON / base64 配置、多仓聚合 urls、相对路径 api 与 M3U/TXT 直播。")
                     .font(.footnote).foregroundColor(.secondary)
                 Text("不内置任何订阅地址，不提供媒体内容。请只添加自己有权访问的源。")
                     .font(.footnote).foregroundColor(.secondary)
@@ -585,7 +635,7 @@ struct SettingsView: View {
                 HStack {
                     Text("版本")
                     Spacer()
-                    Text("1.0.0 · iOS 16").foregroundColor(.secondary)
+                    Text("1.0.1 · iOS 16").foregroundColor(.secondary)
                 }
             }
         }
