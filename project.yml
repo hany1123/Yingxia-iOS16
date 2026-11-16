@@ -22,14 +22,11 @@ targets:
     platform: iOS
     deploymentTarget: "16.0"
     sources:
-      - path: Yingxia16/App.swift
-      - path: Yingxia16/Models.swift
-      - path: Yingxia16/API.swift
-      - path: Yingxia16/Store.swift
-      - path: Yingxia16/Views.swift
-      - path: Yingxia16/Player.swift
+      - path: Yingxia16
+        excludes:
+          - "Info.plist"
     resources:
-      - Yingxia16/Assets.xcassets
+      - path: Yingxia16/Assets.xcassets
     settings:
       base:
         INFOPLIST_FILE: Yingxia16/Info.plist
